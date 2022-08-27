@@ -31,9 +31,6 @@ class RadioChannel:
         self.data = []
 
 
-rc = RadioChannel()
-
-
 class EState(Enum):
     TX = 0
     RX = 1
@@ -46,7 +43,23 @@ class EState(Enum):
 
 SUPERCYCLE_LENGTH = 1 * 10 ** 6
 RC_CHANNEL_CHECK_TIME = 300
-TX_TIME = 1
+TX_TIME = 2 * 10 ** 3
+
+
+class Stat:
+    def __init__(self):
+        self.received = 0
+        self.busy_channel = 0
+
+    def reset(self):
+        self.received = 0
+        self.busy_channel = 0
+
+    def __str__(self):
+        return f'''
+            received = {self.received}
+            busy_channel = {self.busy_channel}
+        '''
 
 
 class Locket:
@@ -61,9 +74,10 @@ class Locket:
 
         self.sleep_timer = 0
         self.tx_freq = 5
-        self.timeslot_size = SUPERCYCLE_LENGTH / self.tx_freq
+        self.timeslot_size = SUPERCYCLE_LENGTH // self.tx_freq
         self.rx_state: defaultdict[str, int] = defaultdict(int)
-        self.received: list[str] = []
+        self.received: set[str] = set()
+        self.stat: Stat = Stat()
 
     def sleep(self, mcs):
         self.sleep_timer = mcs
@@ -73,7 +87,7 @@ class Locket:
         rc.is_free()
 
     def set_state(self, state: EState):
-        logging.info(f"[{self.locket_id}] enter {state} state at {self.relative_time}")
+        logging.info(f"[{self.locket_id}] {self.state} -> {state} state at {self.absolute_time}")
         self.state = state
         self.rx_state.clear()
         self.state_timer = 0
@@ -104,8 +118,7 @@ class Locket:
         elif self.state == EState.TX:
             rc.transmit(self.locket_id)
             if self.state_timer == TX_TIME:
-                sleep_before = self._sleep_before_next_timeslot()
-                self.sleep(sleep_before)
+                self._sleep_before_next_timeslot()
 
         elif self.state == EState.RX:
             packet = rc.receive()
@@ -114,15 +127,18 @@ class Locket:
             if packet is not None:
                 self.rx_state[packet] += 1
                 if self.rx_state[packet] == TX_TIME:
-                    self.received.append(packet)
+                    self.received.add(packet)
 
-        elif self.state == EState.ON:
-            pass
         elif self.state == EState.CHANNEL_CHECK:
-            if not rc.is_free():
-                self.sleep(TX_TIME)
+            # if not rc.is_free():
+            #     self.stat.busy_channel += 1
+            #     self.sleep(TX_TIME)
             if self.state_timer == RC_CHANNEL_CHECK_TIME:
                 self.set_state(EState.TX)
+
+    def reset_stat(self):
+        self.stat.reset()
+        self.received = set()
 
     def _sleep_before_next_timeslot(self):
         self.sleep(self._next_timeslot_start() - self.relative_time)
@@ -131,10 +147,15 @@ class Locket:
         cur_ts = self.relative_time // self.timeslot_size
         return (cur_ts + 1) * self.timeslot_size
 
+    def __eq__(self, other):
+        return self.locket_id == other.locket_id
+
+    def __hash__(self):
+        return self.locket_id
 
 
 class Engine:
-    def __init__(self, lockets: list[Locket]):
+    def __init__(self, lockets: list[Locket], rc: RadioChannel):
         self.lockets: list[Locket] = lockets
         self.time = 0
 
@@ -148,36 +169,51 @@ class Engine:
 
     def tick(self):
         self.time += 1
+        rc.tick()
+        assert rc.time == self.time, \
+            f'abs_time = {self.time} rc_time = {rc.time}'
 
         tx_lockets = self._filter_by_state(EState.TX)
         for locket in tx_lockets:
             locket.tick()
-            assert locket.absolute_time == self.time, f'{locket.absolute_time} {self.time}'
+            assert locket.absolute_time == self.time, \
+                f'{locket.locket_id}: abs_time = {self.time} locket_time = {locket.absolute_time}'
+
+        if (self.lockets[0].state == EState.RX):
+            logging.error(f"RX -> {self.lockets[1].state}")
 
         for locket in self.lockets:
-            if locket not in tx_lockets and locket.state != EState.TX:
+            if locket not in tx_lockets:
                 locket.tick()
-                assert locket.absolute_time == self.time, f'{locket.absolute_time} {self.time}'
+                assert locket.absolute_time == self.time, \
+                    f'{locket.locket_id}: abs_time = {self.time} locket_time = {locket.absolute_time}'
 
     def _filter_by_state(self, state: EState):
-        return filter(lambda l: l.state == state, self.lockets)
+        return list(filter(lambda l: l.state == state, self.lockets))
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.CRITICAL)
 
-    LOCKET_CNT = 2
+    rc = RadioChannel()
+
+    LOCKET_CNT = 5
     lockets = []
     for i in range(LOCKET_CNT):
-        wakeup_time = 1 if i == 0 else 2 * 10 ** 6
+        wakeup_time = 1 if i == 0 else SUPERCYCLE_LENGTH // 2
         lockets.append(Locket(i, wakeup_time))
 
     main_locket = lockets[0]
 
-    engine = Engine(lockets)
-    engine.process(2)
-    print(main_locket.received)
+    engine = Engine(lockets, rc)
 
+    for i in range(3):
+        print(f'Iteration №{i}')
+        engine.process(1)
+        for locket in lockets:
+            print(locket.locket_id)
+            print(locket.stat)
+            print(locket.received)
 
 
 
